@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2md"
+version = "1.0.0"
+description = "Convert PDF documents to Markdown using IBM Docling"
+authors = [{name = "PDF2MD"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing",
+    "Topic :: Text Processing :: Markup",
+    "Topic :: Utilities",
+]
+keywords = ["pdf", "markdown", "converter", "docling", "cli"]
+dependencies = [
+    "docling>=1.0.0",
+    "PyPDF2>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pdf2md"
+Repository = "https://github.com/yourusername/pdf2md"
+Issues = "https://github.com/yourusername/pdf2md/issues"
+
+[project.scripts]
+pdf2md = "pdf2md:main"
+
+[tool.setuptools]
+py-modules = ["pdf2md"]
