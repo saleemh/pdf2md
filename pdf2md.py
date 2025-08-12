@@ -194,14 +194,22 @@ class PDF2MD:
         output_files: List[Path] = []
         page_count = self._get_page_count(input_path)
 
-        # Read outline/TOC
+        # Read outline/TOC with compatibility across PyPDF2 versions
+        outline = None
         try:
             with open(input_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
-                outline = getattr(reader, 'outlines', None)
-                if outline is None:
-                    # compatibility
-                    outline = getattr(reader, 'outline', None)
+                # Prefer singular 'outline' first (PyPDF2 >= 3)
+                try:
+                    outline = reader.outline  # may raise in older/newer versions
+                except Exception:
+                    outline = None
+                # Fallback to 'outlines' (older versions)
+                if not outline:
+                    try:
+                        outline = reader.outlines  # may raise in PyPDF2 3.x
+                    except Exception:
+                        outline = None
         except Exception as e:
             logger.warning(f"Could not read PDF outlines: {e}")
             outline = None
@@ -211,6 +219,7 @@ class PDF2MD:
             return self._convert_fixed_segments(input_path, output_root, fragments_dir, segment_size=50)
 
         nodes = self._build_outline_nodes(outline, input_path)
+        logger.info(f"Found {len(nodes)} TOC entries after normalization")
         if not nodes:
             logger.info("Empty TOC after normalization. Falling back to fixed 50-page segmentation.")
             return self._convert_fixed_segments(input_path, output_root, fragments_dir, segment_size=50)
@@ -299,30 +308,90 @@ class PDF2MD:
     # TOC helpers
     # ---------------------------
     def _build_outline_nodes(self, outline: Any, pdf_path: Path) -> List[Dict[str, Any]]:
-        """Flatten PyPDF2 outline into a list of nodes with title, level, start_page (1-based)."""
+        """Flatten PyPDF2 outline into a list of nodes with title, level, start_page (1-based).
+
+        Handles PyPDF2 2.x nested lists and 3.x OutlineItem structures.
+        """
         nodes: List[Dict[str, Any]] = []
         try:
             with open(pdf_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
 
-                def walk(items: Any, level: int):
-                    for item in items:
-                        # Child list
-                        if isinstance(item, list):
-                            walk(item, level + 1)
-                            continue
-                        # Destination-like
+                def resolve_page_index0(it: Any) -> Optional[int]:
+                    # 1) Explicit .page attribute
+                    page_obj = getattr(it, 'page', None)
+                    if page_obj is not None:
                         try:
-                            title = getattr(item, 'title', None) or str(item)
-                            page_idx0 = reader.get_destination_page_number(item)
-                            nodes.append({
-                                'title': title.strip() if isinstance(title, str) else 'Untitled',
-                                'level': level,
-                                'start_page': page_idx0 + 1,  # store 1-based
-                            })
+                            return list(reader.pages).index(page_obj)
                         except Exception:
-                            # Skip non-destination items silently
-                            continue
+                            pass
+                    # 2) Nested dest.page
+                    dest = getattr(it, 'dest', None)
+                    if dest is not None:
+                        page_obj2 = getattr(dest, 'page', None)
+                        if page_obj2 is not None:
+                            try:
+                                return list(reader.pages).index(page_obj2)
+                            except Exception:
+                                pass
+                    # 3) Try legacy resolver
+                    try:
+                        return reader.get_destination_page_number(it)
+                    except Exception:
+                        return None
+
+                def resolve_title_text(it: Any) -> str:
+                    title = getattr(it, 'title', None)
+                    if isinstance(title, str) and title.strip():
+                        return title.strip()
+                    # Some structures store title on dict-like object
+                    try:
+                        t = str(it)
+                        return t.strip() if t else 'Untitled'
+                    except Exception:
+                        return 'Untitled'
+
+                def iter_children(it: Any) -> List[Any]:
+                    # OutlineItem may be iterable or have .children
+                    ch = getattr(it, 'children', None)
+                    if ch:
+                        try:
+                            return list(ch)
+                        except Exception:
+                            pass
+                    try:
+                        # Avoid treating strings/bytes as iterable of chars
+                        if isinstance(it, (str, bytes)):
+                            return []
+                        lst = list(it)
+                        return lst
+                    except Exception:
+                        return []
+
+                def walk(items: Any, level: int):
+                    # items can be a list or a single OutlineItem
+                    if isinstance(items, list):
+                        for sub in items:
+                            walk(sub, level)
+                        return
+                    item = items
+                    # If item is a list, it's a deeper level container
+                    if isinstance(item, list):
+                        walk(item, level + 1)
+                        return
+                    # Capture this item
+                    page_idx0 = resolve_page_index0(item)
+                    if page_idx0 is not None:
+                        nodes.append({
+                            'title': resolve_title_text(item),
+                            'level': level,
+                            'start_page': page_idx0 + 1,
+                        })
+                    # Recurse into children
+                    children = iter_children(item)
+                    if children:
+                        for ch in children:
+                            walk(ch, level + 1)
 
                 walk(outline, 1)
 
