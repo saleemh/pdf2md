@@ -655,6 +655,7 @@ Examples:
   pdf2md document.pdf              Convert a single PDF
   pdf2md "my document.pdf"         Convert PDF with spaces in filename
   pdf2md /path/to/document.pdf     Convert PDF with full path
+  pdf2md /path/to/folder           Convert all PDFs in a folder (non-recursive)
 
 Notes:
   - Output files are created in the same directory as the input PDF
@@ -665,7 +666,7 @@ Notes:
     
     parser.add_argument(
         'pdf_file',
-        help='Path to the PDF file to convert'
+        help='Path to a PDF file or a directory containing PDFs (non-recursive)'
     )
     
     parser.add_argument(
@@ -684,18 +685,43 @@ Notes:
     input_path = Path(args.pdf_file).resolve()
     
     try:
-        # Initialize converter and process
+        # Initialize converter
         converter = PDF2MD()
-        output_files = converter.convert_pdf(input_path)
         
-        # Print results
-        print(f"\n✅ Conversion completed successfully!")
-        print(f"📄 Input: {input_path.name}")
-        print(f"📁 Output directory: {input_path.parent / (input_path.stem + '-output')}")
-        print(f"📝 Generated {len(output_files)} markdown file(s):")
-        
-        for output_file in output_files:
-            print(f"   - {output_file.name}")
+        if input_path.is_dir():
+            pdf_files = sorted([
+                p for p in input_path.iterdir()
+                if p.is_file() and p.suffix.lower() == '.pdf'
+            ])
+            if not pdf_files:
+                print(f"\n❌ No PDF files found in folder: {input_path}")
+                sys.exit(1)
+            total_outputs = 0
+            processed = 0
+            print(f"\n📂 Found {len(pdf_files)} PDF(s) in folder: {input_path}")
+            for pdf_file in pdf_files:
+                try:
+                    outputs = converter.convert_pdf(pdf_file)
+                    total_outputs += len(outputs)
+                    processed += 1
+                except Exception as e:
+                    print(f"❌ Error converting {pdf_file.name}: {e}")
+                    continue
+            print(f"\n✅ Batch conversion completed!")
+            print(f"📦 Folder: {input_path}")
+            print(f"📄 PDFs processed: {processed}/{len(pdf_files)}")
+            print(f"📝 Total markdown files generated: {total_outputs}")
+        else:
+            output_files = converter.convert_pdf(input_path)
+            
+            # Print results
+            print(f"\n✅ Conversion completed successfully!")
+            print(f"📄 Input: {input_path.name}")
+            print(f"📁 Output directory: {input_path.parent / (input_path.stem + '-output')}")
+            print(f"📝 Generated {len(output_files)} markdown file(s):")
+            
+            for output_file in output_files:
+                print(f"   - {output_file.name}")
         
     except KeyboardInterrupt:
         print("\n❌ Conversion cancelled by user")
