@@ -7,6 +7,11 @@ docling>=1.0.0
 # PDF manipulation for segmentation
 PyPDF2>=3.0.0
 
+# Optional: GPT-4o engine support
+openai>=1.30.0
+PyMuPDF>=1.24.0
+python-dotenv>=1.0.1
+
 # Standard library dependencies (usually included with Python)
 # pathlib - for file path handling
 # argparse - for CLI interface

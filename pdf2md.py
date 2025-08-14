@@ -23,38 +23,96 @@ from dataclasses import dataclass
 import re
 import statistics
 import argparse
+import os
 
 try:
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
     DOCLING_AVAILABLE = True
 except ImportError:
     DOCLING_AVAILABLE = False
-    print("Error: docling is not installed. Please install with: pip install docling")
-    sys.exit(1)
+    print("Warning: docling is not installed. The 'docling' engine will be unavailable.")
 
 try:
     import PyPDF2
     PYPDF2_AVAILABLE = True
 except ImportError:
     PYPDF2_AVAILABLE = False
-    print("Error: PyPDF2 is not installed. Please install with: pip install PyPDF2")
-    sys.exit(1)
+    print("Warning: PyPDF2 is not installed. Page counting will be approximate.")
+
+# Docling VLM pipeline (optional)
+try:
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import VlmPipelineOptions, ApiVlmOptions, ResponseFormat
+    from docling.pipeline.vlm_pipeline import VlmPipeline
+    DOCLING_VLM_AVAILABLE = True
+except Exception:
+    DOCLING_VLM_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
+# Load environment variables from project .env (adjacent to this file) if present
+try:
+    from dotenv import load_dotenv
+    _DOTENV_PATH = Path(__file__).parent / '.env'
+    load_dotenv(dotenv_path=_DOTENV_PATH, override=True)
+except Exception:
+    pass
+
 
 class PDF2MD:
-    """PDF to Markdown converter with automatic segmentation for large files."""
-    
-    def __init__(self):
-        """Initialize the converter with Docling."""
+    """PDF to Markdown converter with Docling and optional VLM auto-routing."""
+
+    def __init__(self, openai_mode: str = "auto", openai_model: Optional[str] = None):
+        """Initialize the converter.
+
+        openai_mode: 'always' | 'auto' | 'never'
+        openai_model: optional; overrides model from env; defaults to 'gpt-4o'
+        """
+        if openai_mode not in {"always", "auto", "never"}:
+            raise ValueError("openai_mode must be one of: 'always', 'auto', 'never'")
+        self.openai_mode = openai_mode
+        self.openai_model = openai_model
+
         if not DOCLING_AVAILABLE:
-            raise Exception("Docling is required but not available")
-        
-        self.converter = DocumentConverter()
-        logger.info("PDF2MD converter initialized")
+            raise Exception("Docling is not installed. Install with: pip install docling")
+
+        # Standard Docling converter is always available
+        self.converter_docling = DocumentConverter()
+        self.converter_vlm: Optional[DocumentConverter] = None
+
+        if self.openai_mode in {"always", "auto"} and DOCLING_VLM_AVAILABLE:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                logger.warning("OPENAI_API_KEY not set; VLM will be unavailable. Falling back to Docling.")
+            else:
+                model_name = self.openai_model or os.getenv("DOCLING_VLM_OPENAI_MODEL") or "gpt-4o"
+                prompt_text = os.getenv("DOCLING_VLM_PROMPT") or (
+                    "Convert this page to GitHub-Flavored Markdown. Preserve headings, lists, tables, and code blocks. "
+                    "Use proper table syntax. Do not add commentary. Output only Markdown."
+                )
+                pipeline_options = VlmPipelineOptions(
+                    enable_remote_services=True,
+                    vlm_options=ApiVlmOptions(
+                        url="https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        params={"model": model_name},
+                        prompt=prompt_text,
+                        response_format=ResponseFormat.MARKDOWN,
+                        timeout=120,
+                        scale=1.0,
+                    ),
+                )
+                self.converter_vlm = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(
+                            pipeline_cls=VlmPipeline,
+                            pipeline_options=pipeline_options,
+                        )
+                    }
+                )
+                logger.info(f"VLM converter initialized (model={model_name})")
     
     def convert_pdf(self, input_path: Path) -> List[Path]:
         """
@@ -87,6 +145,8 @@ class PDF2MD:
         if page_count <= 50:
             logger.info("Processing as single document")
             output_file = output_root / f"{input_path.stem}.md"
+            # Decide converter based on mode and content
+            converter_to_use = self._select_converter_for_document(input_path)
             # Single-file conversion
             self._convert_single_pdf(
                 input_path,
@@ -97,6 +157,7 @@ class PDF2MD:
                     "pages": f"1-{page_count}",
                     "section": None,
                 },
+                converter=converter_to_use,
             )
             output_files.append(output_file)
         else:
@@ -129,6 +190,7 @@ class PDF2MD:
         input_path: Path,
         output_path: Path,
         header_meta: Optional[Dict[str, Optional[str]]] = None,
+        converter: Optional[Any] = None,
     ):
         """Convert a single PDF to markdown.
 
@@ -139,14 +201,40 @@ class PDF2MD:
           - section: str (e.g., "H2 (TOC)")
         """
         try:
-            # Convert with Docling
-            result = self.converter.convert(input_path)
-            
-            # Extract markdown content
-            if hasattr(result, 'document') and hasattr(result.document, 'export_to_markdown'):
-                markdown_content = result.document.export_to_markdown()
-            else:
-                raise Exception("Could not extract markdown from conversion result")
+            # Convert with selected converter (default to standard Docling)
+            conv = converter or self.converter_docling
+            try:
+                result = conv.convert(input_path)
+            except Exception as primary_error:
+                # If VLM conversion fails, fall back to standard Docling automatically
+                if conv is self.converter_vlm:
+                    logger.warning(
+                        f"VLM conversion failed: {primary_error}. Falling back to standard Docling."
+                    )
+                    conv = self.converter_docling
+                    result = conv.convert(input_path)
+                else:
+                    raise
+
+            # Extract markdown content with fallback if VLM export fails
+            try:
+                if hasattr(result, 'document') and hasattr(result.document, 'export_to_markdown'):
+                    markdown_content = result.document.export_to_markdown()
+                else:
+                    raise Exception("Could not extract markdown from conversion result")
+            except Exception as export_error:
+                if conv is self.converter_vlm:
+                    logger.warning(
+                        f"VLM export failed: {export_error}. Falling back to standard Docling."
+                    )
+                    conv = self.converter_docling
+                    result = conv.convert(input_path)
+                    if hasattr(result, 'document') and hasattr(result.document, 'export_to_markdown'):
+                        markdown_content = result.document.export_to_markdown()
+                    else:
+                        raise Exception("Could not extract markdown from Docling conversion result")
+                else:
+                    raise
             
             # Add document header
             if header_meta is None:
@@ -252,7 +340,12 @@ class PDF2MD:
             logger.info(f"Processing segment: {seg_id} {title} (pages {start_page}-{end_page})")
 
             try:
+                # Clamp invalid page ranges defensively
+                if end_page < start_page:
+                    end_page = start_page
                 self._create_pdf_segment(input_path, pdf_segment_path, start_page, end_page)
+                # Decide converter for this segment
+                converter_to_use = self._select_converter_for_segment(input_path, start_page, end_page)
                 self._convert_single_pdf(
                     pdf_segment_path,
                     md_segment_path,
@@ -262,6 +355,7 @@ class PDF2MD:
                         "pages": f"{start_page}-{end_page}",
                         "section": level_str,
                     },
+                    converter=converter_to_use,
                 )
                 output_files.append(md_segment_path)
             except Exception as e:
@@ -485,7 +579,7 @@ class PDF2MD:
                 'title': 'Front matter',
                 'level': 0,
                 'start_page': 1,
-                'end_page': (starts[0] - 1) if starts else page_count,
+                'end_page': max(1, (starts[0] - 1) if starts else page_count),
             })
 
         # Compute numbered segments
@@ -499,6 +593,9 @@ class PDF2MD:
                     break
             start_page = n['start_page']
             end_page = (next_start - 1) if next_start is not None else page_count
+            # Guard against zero/negative-length segments when successive nodes share the same start page
+            if end_page < start_page:
+                end_page = start_page
 
             # Update counters
             lvl = n['level']
@@ -611,6 +708,8 @@ class PDF2MD:
             md_segment_path = output_root / md_name
             try:
                 self._create_pdf_segment(input_path, pdf_segment_path, start_page, end_page)
+                # Decide converter for this segment
+                converter_to_use = self._select_converter_for_segment(input_path, start_page, end_page)
                 self._convert_single_pdf(
                     pdf_segment_path,
                     md_segment_path,
@@ -620,6 +719,7 @@ class PDF2MD:
                         "pages": f"{start_page}-{end_page}",
                         "section": None,
                     },
+                    converter=converter_to_use,
                 )
                 output_files.append(md_segment_path)
             except Exception as e:
@@ -644,6 +744,71 @@ class PDF2MD:
         )
         return output_files
 
+    # ---------------------------
+    # Auto-routing helpers
+    # ---------------------------
+    def _select_converter_for_document(self, pdf_path: Path) -> Any:
+        if self.openai_mode == "never" or not self.converter_vlm:
+            return self.converter_docling
+        if self.openai_mode == "always":
+            return self.converter_vlm
+        # auto mode: inspect document
+        try:
+            with open(pdf_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                num_pages = len(reader.pages)
+                pages_with_images_and_low_text = 0
+                for i in range(num_pages):
+                    page = reader.pages[i]
+                    text_len = len((page.extract_text() or "").strip())
+                    if self._page_has_images(reader, i) and text_len < 50:
+                        pages_with_images_and_low_text += 1
+                ratio = pages_with_images_and_low_text / max(1, num_pages)
+                return self.converter_vlm if ratio >= 0.2 else self.converter_docling
+        except Exception:
+            return self.converter_docling
+
+    def _select_converter_for_segment(self, pdf_path: Path, start_page: int, end_page: int) -> Any:
+        if self.openai_mode == "never" or not self.converter_vlm:
+            return self.converter_docling
+        if self.openai_mode == "always":
+            return self.converter_vlm
+        # auto mode: inspect pages in range (1-based)
+        try:
+            with open(pdf_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                start_idx = max(0, start_page - 1)
+                end_idx = min(len(reader.pages) - 1, end_page - 1)
+                for i in range(start_idx, end_idx + 1):
+                    page = reader.pages[i]
+                    text_len = len((page.extract_text() or "").strip())
+                    if self._page_has_images(reader, i) and text_len < 50:
+                        return self.converter_vlm
+                return self.converter_docling
+        except Exception:
+            return self.converter_docling
+
+    def _page_has_images(self, reader: Any, page_index: int) -> bool:
+        try:
+            page = reader.pages[page_index]
+            resources = page.get('/Resources')
+            if not resources:
+                return False
+            xobj = resources.get('/XObject')
+            if not xobj:
+                return False
+            for name in xobj.keys():
+                try:
+                    obj = xobj[name].get_object()
+                    subtype = obj.get('/Subtype')
+                    if subtype and str(subtype) == '/Image':
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
 
 def main():
     """Main CLI entry point."""
@@ -661,6 +826,7 @@ Notes:
   - Output files are created in the same directory as the input PDF
   - Large PDFs (>50 pages) are automatically split into segments
   - Both PDF segments and markdown files are kept for reference
+  - OpenAI usage via Docling's VLM defaults to 'auto' routing; override with --openai-mode
         """
     )
     
@@ -674,6 +840,12 @@ Notes:
         action='store_true',
         help='Enable verbose logging'
     )
+
+    parser.add_argument(
+        '--openai-mode',
+        choices=['always', 'auto', 'never'],
+        help="When to use OpenAI via Docling VLM: 'always', 'auto' (default), or 'never'"
+    )
     
     args = parser.parse_args()
     
@@ -686,7 +858,29 @@ Notes:
     
     try:
         # Initialize converter
-        converter = PDF2MD()
+        # Determine whether to use OpenAI from CLI or environment (default: True)
+        def _env_truthy(value: Optional[str]) -> Optional[bool]:
+            if value is None:
+                return None
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+
+        env_val = _env_truthy(os.getenv('USE_OPENAI'))
+        env_mode_raw = (os.getenv('OPENAI_MODE') or '').strip().lower()
+        env_mode = env_mode_raw if env_mode_raw in {'always','auto','never'} else None
+        # Default mode is 'auto' unless overridden by CLI or env
+        if args.openai_mode:
+            openai_mode = args.openai_mode
+        elif env_mode is not None:
+            openai_mode = env_mode
+        else:
+            if env_val is True:
+                openai_mode = 'always'
+            elif env_val is False:
+                openai_mode = 'never'
+            else:
+                openai_mode = 'auto'
+
+        converter = PDF2MD(openai_mode=openai_mode)
         
         if input_path.is_dir():
             pdf_files = sorted([
